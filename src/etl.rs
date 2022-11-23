@@ -78,13 +78,21 @@ pub(crate) enum TraceHeaderType {
 }
 impl TraceHeaderType {
     pub fn is_system(&self) -> bool {
-        let byte: u8 = (*self).into();
-        byte >= 0x01 && byte <= 0x04
+        match self {
+            Self::System32 => true,
+            Self::System64 => true,
+            Self::Compact32 => true,
+            Self::Compact64 => true,
+            _ => false,
+        }
     }
 
     pub fn is_system_compact(&self) -> bool {
-        let byte: u8 = (*self).into();
-        byte >= 0x03 && byte <= 0x04
+        match self {
+            Self::Compact32 => true,
+            Self::Compact64 => true,
+            _ => false,
+        }
     }
 
     pub fn is_64_bit(&self) -> bool {
