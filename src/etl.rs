@@ -350,7 +350,7 @@ pub(crate) fn read_event<R: Read>(mut reader: R) -> Result<TraceEvent, EtlError>
         };
 
         let size = u16::from_le_bytes(more_header_slice[0..2].try_into().unwrap());
-        let payload_size = usize::from(size) - more_header_slice.len() - 4;
+        let logfile_header_and_payload_size = usize::from(size) - (header_bytes.len() + more_header_slice.len());
 
         let system_header = SystemTraceHeader {
             version: u16::from_le_bytes(header_bytes[0..2].try_into().unwrap()),
@@ -380,6 +380,7 @@ pub(crate) fn read_event<R: Read>(mut reader: R) -> Result<TraceEvent, EtlError>
             let log_file_name_ptr = u32::from_le_bytes(logfile_header_bytes[60..64].try_into().unwrap()).into();
             (&logfile_header_bytes[..272], logger_name_ptr, log_file_name_ptr, 64)
         };
+        let payload_size = logfile_header_and_payload_size - logfile_header_slice.len();
 
         // deconstruct the logfile header
         let logfile_header = TraceLogfileHeader {
