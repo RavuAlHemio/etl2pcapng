@@ -419,8 +419,8 @@ pub(crate) fn read_event<R: Read>(mut reader: R) -> Result<TraceEvent, EtlError>
         reader.read_exact(payload_buf.as_mut_slice())?;
 
         let mut payload_reader = Cursor::new(&payload_buf);
-        let log_file_name = read_nul_terminated_utf16_le(&mut payload_reader)?;
         let logger_name = read_nul_terminated_utf16_le(&mut payload_reader)?;
+        let log_file_name = read_nul_terminated_utf16_le(&mut payload_reader)?;
 
         return Ok(TraceEvent::System(SystemTraceEvent {
             system_header,
