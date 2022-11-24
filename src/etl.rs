@@ -7,10 +7,19 @@
 
 
 use std::fmt;
-use std::io::{self, Cursor, Read};
+use std::io::{self, BufRead, Cursor, Read};
 use std::string::FromUtf16Error;
 
 use from_to_repr::from_to_other;
+
+
+const HOOK_UPPER_EVENT_TRACE_GROUP_HEADER: u16 = 0x0000;
+
+const HOOK_LOWER_EVENT_TRACE_TYPE_INFO: u16 = 0x00;
+const HOOK_LOWER_EVENT_TRACE_TYPE_EXTENSION: u16 = 0x05;
+
+const HOOK_WMI_LOG_TYPE_HEADER: u16 = HOOK_UPPER_EVENT_TRACE_GROUP_HEADER | HOOK_LOWER_EVENT_TRACE_TYPE_INFO;
+const HOOK_WMI_LOG_TYPE_HEADER_EXTENSION: u16 = HOOK_UPPER_EVENT_TRACE_GROUP_HEADER | HOOK_LOWER_EVENT_TRACE_TYPE_EXTENSION;
 
 
 /// An error produced by reading ETL data.
@@ -27,6 +36,9 @@ pub(crate) enum EtlError {
 
     /// Mismatched length when trying to decode an inner field.
     LengthMismatch { field_type: &'static str, expected: usize, obtained: usize },
+
+    /// An unknown or unsupported system header type was encountered.
+    UnknownSystemHeaderType(u16),
 }
 impl fmt::Display for EtlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -39,6 +51,8 @@ impl fmt::Display for EtlError {
                 => write!(f, "UTF-16 decoding failed: {}", e),
             Self::LengthMismatch { field_type, expected, obtained }
                 => write!(f, "failed to decode {}: expected {} bytes, obtained {}", field_type, expected, obtained),
+            Self::UnknownSystemHeaderType(ht)
+                => write!(f, "unknown system header type 0x{:04X}", ht),
         }
     }
 }
@@ -49,6 +63,69 @@ impl From<io::Error> for EtlError {
 }
 impl From<FromUtf16Error> for EtlError {
     fn from(e: FromUtf16Error) -> Self { Self::Utf16Decoding(e) }
+}
+
+
+/// Information about the ETW (Event Tracing for Windows) buffer context.
+///
+/// Reconstructed from (a simplified interpretation of) [Microsoft's `ETW_BUFFER_CONTEXT` documentation].
+///
+/// [Microsoft's `ETW_BUFFER_CONTEXT` documentation](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-etw_buffer_context)
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct EtwBufferContext {
+    pub processor_index: u16,
+    pub logger_id: u16,
+}
+
+
+/// A padding value, either stored or dropped (but of a known size).
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum PossiblePadding {
+    Stored(Vec<u8>),
+    DroppedSize(usize),
+}
+impl Default for PossiblePadding {
+    fn default() -> Self { Self::Stored(Vec::with_capacity(0)) }
+}
+
+
+/// The header of each buffer in an ETL file.
+///
+/// This structure is only guaranteed to be used since Windows version 6.1 (Windows 7). Previous
+/// Windows versions structure this differently and the differences are sometimes wild.
+///
+/// Reconstructed from [Geoff Chappell's description of `WMI_BUFFER_HEADER`].
+/// 
+/// [Geoff Chappell's description of `WMI_BUFFER_HEADER`](https://www.geoffchappell.com/studies/windows/km/ntoskrnl/api/etw/tracelog/wmi_buffer_header.htm)
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct WmiBufferHeader {
+    pub buffer_size: u32,
+    pub saved_offset: u32,
+    pub current_offset: u32,
+    pub reference_count: i32,
+    pub time_stamp: i64,
+    pub sequence_number: i64,
+    pub clock_type_and_frequency: u64, // 3 bits clock_type, 61 bits frequency
+    pub context: EtwBufferContext,
+    pub padding0: u32,
+    pub offset: u32,
+    pub buffer_flag: u16,
+    pub buffer_type: u16,
+    pub union_of_pretty_much_everything: [u8; 16],
+}
+
+
+/// A complete WMI buffer.
+///
+/// A buffer consists of a header, a payload and padding. The length of the header is fixed (0x48 =
+/// 72 bytes). The length of the payload is stored in the header's `offset` field. The padding is
+/// generally a sequence of bytes with value 0xFF; its length can be calculated from `buffer_size`,
+/// which is the sum of the lengths of header, payload (whose length is in `offset`), and padding.
+#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct WmiBuffer {
+    pub header: WmiBufferHeader,
+    pub payload: Vec<u8>,
+    pub padding: PossiblePadding,
 }
 
 
@@ -228,6 +305,9 @@ impl TryFrom<&[u8]> for TimeZoneInformation {
 
 /// The system trace header. Describes basic metadata of the whole trace.
 ///
+/// When serialized, the header has a size of 0x20 (full variant) or 0x18 (compact variant; missing
+/// `kernel_time` and `user_time`) bytes.
+///
 /// Reconstructed from [Geoff Chappell's description of `SYSTEM_TRACE_HEADER`].
 /// 
 /// [Geoff Chappell's description of `SYSTEM_TRACE_HEADER`](https://www.geoffchappell.com/studies/windows/km/ntoskrnl/api/etw/tracelog/system_trace_header.htm)
@@ -281,24 +361,33 @@ pub(crate) struct TraceLogfileHeader {
     pub buffers_lost: u32,
 }
 
-/// A complete system trace event.
+/// A trace logfile header event.
 ///
 /// Reconstructed from [Geoff Chappell's description of `TRACE_LOGFILE_HEADER`].
 /// 
 /// [Geoff Chappell's description of `TRACE_LOGFILE_HEADER`](https://www.geoffchappell.com/studies/windows/km/ntoskrnl/api/etw/tracelog/trace_logfile_header.htm)
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct SystemTraceEvent {
+pub(crate) struct TraceLogfileHeaderEvent {
     pub system_header: SystemTraceHeader,
     pub logfile_header: TraceLogfileHeader,
     pub logger_name: String,
     pub log_file_name: String,
 }
 
+/// Unknown system trace event with hook ID 0x0050.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct Unknown50Event {
+    pub system_header: SystemTraceHeader,
+    pub full_payload: Vec<u8>,
+}
+
 
 /// Any kind of trace event.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum TraceEvent {
-    System(SystemTraceEvent),
+    TraceLogfileHeader(TraceLogfileHeaderEvent),
+    Unknown50(Unknown50Event),
+    Padding(usize),
 }
 
 
@@ -319,33 +408,66 @@ fn read_nul_terminated_utf16_le<R: Read>(mut reader: R) -> Result<String, EtlErr
 }
 
 
-/// Reads the bytes of the `WMI_BUFFER_HEADER` structure at the beginning of an ETL file.
-///
-/// Geoff Chappell has [some documentation on `WMI_BUFFER_HEADER`] on this format; since its content
-/// isn't very useful to us and changed dramatically between Windows versions, we simply return it
-/// uninterpreted.
-///
-/// [some documentation on `WMI_BUFFER_HEADER`](https://www.geoffchappell.com/studies/windows/km/ntoskrnl/api/etw/tracelog/wmi_buffer_header.htm)
-pub(crate) fn read_wmi_buffer_header<R: Read>(mut reader: R) -> Result<[u8; 72], EtlError> {
-    let mut buf = [0u8; 72];
-    reader.read_exact(&mut buf)?;
-    Ok(buf)
+/// Reads the bytes of the next WMI buffer structure in an ETL file.
+pub(crate) fn read_wmi_buffer<R: BufRead>(mut etl_reader: R, store_padding: bool) -> Result<WmiBuffer, EtlError> {
+    let mut header_buf = [0u8; 72];
+    etl_reader.read_exact(&mut header_buf)?;
+
+    let header = WmiBufferHeader {
+        buffer_size: u32::from_le_bytes(header_buf[0..4].try_into().unwrap()),
+        saved_offset: u32::from_le_bytes(header_buf[4..8].try_into().unwrap()),
+        current_offset: u32::from_le_bytes(header_buf[8..12].try_into().unwrap()),
+        reference_count: i32::from_le_bytes(header_buf[12..16].try_into().unwrap()),
+        time_stamp: i64::from_le_bytes(header_buf[16..24].try_into().unwrap()),
+        sequence_number: i64::from_le_bytes(header_buf[24..32].try_into().unwrap()),
+        clock_type_and_frequency: u64::from_le_bytes(header_buf[32..40].try_into().unwrap()),
+        context: EtwBufferContext {
+            processor_index: u16::from_le_bytes(header_buf[40..42].try_into().unwrap()),
+            logger_id: u16::from_le_bytes(header_buf[42..44].try_into().unwrap()),
+        },
+        padding0: u32::from_le_bytes(header_buf[44..48].try_into().unwrap()),
+        offset: u32::from_le_bytes(header_buf[48..52].try_into().unwrap()),
+        buffer_flag: u16::from_le_bytes(header_buf[52..54].try_into().unwrap()),
+        buffer_type: u16::from_le_bytes(header_buf[54..56].try_into().unwrap()),
+        union_of_pretty_much_everything: header_buf[56..72].try_into().unwrap(),
+    };
+    let offset_usize: usize = header.offset.try_into().unwrap();
+
+    let mut payload = vec![0u8; offset_usize];
+    etl_reader.read_exact(&mut payload)?;
+
+    let buffer_size: usize = header.buffer_size.try_into().unwrap();
+    let padding_size = buffer_size - (header_buf.len() + offset_usize);
+    let mut padding_vec = vec![0u8; padding_size];
+    etl_reader.read_exact(&mut padding_vec)?;
+
+    let padding = if store_padding {
+        PossiblePadding::Stored(padding_vec)
+    } else {
+        PossiblePadding::DroppedSize(padding_vec.len())
+    };
+
+    Ok(WmiBuffer {
+        header,
+        payload,
+        padding,
+    })
 }
 
 
-pub(crate) fn read_event<R: Read>(mut reader: R) -> Result<TraceEvent, EtlError> {
+pub(crate) fn read_event<R: BufRead>(mut buffer_reader: R) -> Result<TraceEvent, EtlError> {
     // read 4 header bytes
     let mut header_bytes = [0u8; 4];
-    reader.read_exact(&mut header_bytes)?;
+    buffer_reader.read_exact(&mut header_bytes)?;
 
     let trace_header_type: TraceHeaderType = header_bytes[2].into();
     if trace_header_type.is_system() {
         let mut more_header_bytes = [0u8; 28];
         let more_header_slice = if trace_header_type.is_system_compact() {
-            reader.read_exact(&mut more_header_bytes[0..20])?;
+            buffer_reader.read_exact(&mut more_header_bytes[0..20])?;
             &more_header_bytes[0..20]
         } else {
-            reader.read_exact(&mut more_header_bytes)?;
+            buffer_reader.read_exact(&mut more_header_bytes)?;
             &more_header_bytes
         };
 
@@ -367,68 +489,85 @@ pub(crate) fn read_event<R: Read>(mut reader: R) -> Result<TraceEvent, EtlError>
             user_time: (more_header_slice.len() >= 28).then(|| u32::from_le_bytes(more_header_slice[24..28].try_into().unwrap())),
         };
 
-        // read bytes for the logfile header
-        let mut logfile_header_bytes = [0u8; 280];
-        let (logfile_header_slice, logger_name_ptr, log_file_name_ptr, time_zone_offset) = if trace_header_type.is_64_bit() {
-            reader.read_exact(&mut logfile_header_bytes)?;
-            let logger_name_ptr = u64::from_le_bytes(logfile_header_bytes[56..64].try_into().unwrap());
-            let log_file_name_ptr = u64::from_le_bytes(logfile_header_bytes[64..72].try_into().unwrap());
-            (&logfile_header_bytes[..], logger_name_ptr, log_file_name_ptr, 72)
+        if system_header.hook_id == HOOK_WMI_LOG_TYPE_HEADER {
+            // read bytes for the logfile header
+            let mut logfile_header_bytes = [0u8; 280];
+            let (logfile_header_slice, logger_name_ptr, log_file_name_ptr, time_zone_offset) = if trace_header_type.is_64_bit() {
+                buffer_reader.read_exact(&mut logfile_header_bytes)?;
+                let logger_name_ptr = u64::from_le_bytes(logfile_header_bytes[56..64].try_into().unwrap());
+                let log_file_name_ptr = u64::from_le_bytes(logfile_header_bytes[64..72].try_into().unwrap());
+                (&logfile_header_bytes[..], logger_name_ptr, log_file_name_ptr, 72)
+            } else {
+                buffer_reader.read_exact(&mut logfile_header_bytes[0..272])?;
+                let logger_name_ptr = u32::from_le_bytes(logfile_header_bytes[56..60].try_into().unwrap()).into();
+                let log_file_name_ptr = u32::from_le_bytes(logfile_header_bytes[60..64].try_into().unwrap()).into();
+                (&logfile_header_bytes[..272], logger_name_ptr, log_file_name_ptr, 64)
+            };
+            let payload_size = logfile_header_and_payload_size - logfile_header_slice.len();
+
+            // deconstruct the logfile header
+            let logfile_header = TraceLogfileHeader {
+                buffer_size: u32::from_le_bytes(logfile_header_slice[0..4].try_into().unwrap()),
+                version: logfile_header_slice[4..8].try_into().unwrap(),
+                provider_version: u32::from_le_bytes(logfile_header_slice[8..12].try_into().unwrap()),
+                num_processors: u32::from_le_bytes(logfile_header_slice[12..16].try_into().unwrap()),
+                end_time: i64::from_be_bytes(logfile_header_slice[16..24].try_into().unwrap()),
+                timer_resolution: u32::from_le_bytes(logfile_header_slice[24..28].try_into().unwrap()),
+                max_file_size: u32::from_le_bytes(logfile_header_slice[28..32].try_into().unwrap()),
+                log_file_mode: u32::from_le_bytes(logfile_header_slice[32..36].try_into().unwrap()),
+                buffers_written: u32::from_le_bytes(logfile_header_slice[36..40].try_into().unwrap()),
+
+                // union
+                //   variant
+                log_instance_guid: WindowsGuid::try_from(&logfile_header_slice[40..56]).unwrap(),
+                //   variant
+                start_buffers: u32::from_le_bytes(logfile_header_slice[40..44].try_into().unwrap()),
+                pointer_size: u32::from_le_bytes(logfile_header_slice[44..48].try_into().unwrap()),
+                events_lost: u32::from_le_bytes(logfile_header_slice[48..52].try_into().unwrap()),
+                cpu_speed_mhz: u32::from_le_bytes(logfile_header_slice[52..56].try_into().unwrap()),
+
+                logger_name_ptr,
+                log_file_name_ptr,
+
+                time_zone: TimeZoneInformation::try_from(&logfile_header_slice[time_zone_offset..time_zone_offset+172]).unwrap(),
+                // 4 bytes of padding
+                boot_time: i64::from_le_bytes(logfile_header_slice[time_zone_offset+176..time_zone_offset+184].try_into().unwrap()),
+                perf_freq: i64::from_le_bytes(logfile_header_slice[time_zone_offset+184..time_zone_offset+192].try_into().unwrap()),
+                start_time: i64::from_le_bytes(logfile_header_slice[time_zone_offset+192..time_zone_offset+200].try_into().unwrap()),
+                reserved_flags: u32::from_le_bytes(logfile_header_slice[time_zone_offset+192..time_zone_offset+196].try_into().unwrap()),
+                buffers_lost: u32::from_le_bytes(logfile_header_slice[time_zone_offset+196..time_zone_offset+200].try_into().unwrap()),
+            };
+
+            // the payload contains the logger and log file names
+            let mut payload_buf = vec![0u8; payload_size];
+            buffer_reader.read_exact(payload_buf.as_mut_slice())?;
+
+            let mut payload_reader = Cursor::new(&payload_buf);
+            let logger_name = read_nul_terminated_utf16_le(&mut payload_reader)?;
+            let log_file_name = read_nul_terminated_utf16_le(&mut payload_reader)?;
+
+            // skip padding
+            let padding = 0x10 - (header_bytes.len() + more_header_slice.len() + logfile_header_slice.len() + payload_size) % 0x10;
+            let mut nevermind = vec![0u8; padding];
+            buffer_reader.read_exact(&mut nevermind)?;
+
+            return Ok(TraceEvent::TraceLogfileHeader(TraceLogfileHeaderEvent {
+                system_header,
+                logfile_header,
+                logger_name,
+                log_file_name,
+            }));
+        } else if system_header.hook_id == 0x0050 {
+            // no idea what happens here
+            let mut full_payload = vec![0u8; logfile_header_and_payload_size.try_into().unwrap()];
+            buffer_reader.read_exact(&mut full_payload)?;
+            return Ok(TraceEvent::Unknown50(Unknown50Event {
+                system_header,
+                full_payload,
+            }));
         } else {
-            reader.read_exact(&mut logfile_header_bytes[0..272])?;
-            let logger_name_ptr = u32::from_le_bytes(logfile_header_bytes[56..60].try_into().unwrap()).into();
-            let log_file_name_ptr = u32::from_le_bytes(logfile_header_bytes[60..64].try_into().unwrap()).into();
-            (&logfile_header_bytes[..272], logger_name_ptr, log_file_name_ptr, 64)
-        };
-        let payload_size = logfile_header_and_payload_size - logfile_header_slice.len();
-
-        // deconstruct the logfile header
-        let logfile_header = TraceLogfileHeader {
-            buffer_size: u32::from_le_bytes(logfile_header_slice[0..4].try_into().unwrap()),
-            version: logfile_header_slice[4..8].try_into().unwrap(),
-            provider_version: u32::from_le_bytes(logfile_header_slice[8..12].try_into().unwrap()),
-            num_processors: u32::from_le_bytes(logfile_header_slice[12..16].try_into().unwrap()),
-            end_time: i64::from_be_bytes(logfile_header_slice[16..24].try_into().unwrap()),
-            timer_resolution: u32::from_le_bytes(logfile_header_slice[24..28].try_into().unwrap()),
-            max_file_size: u32::from_le_bytes(logfile_header_slice[28..32].try_into().unwrap()),
-            log_file_mode: u32::from_le_bytes(logfile_header_slice[32..36].try_into().unwrap()),
-            buffers_written: u32::from_le_bytes(logfile_header_slice[36..40].try_into().unwrap()),
-
-            // union
-            //   variant
-            log_instance_guid: WindowsGuid::try_from(&logfile_header_slice[40..56]).unwrap(),
-            //   variant
-            start_buffers: u32::from_le_bytes(logfile_header_slice[40..44].try_into().unwrap()),
-            pointer_size: u32::from_le_bytes(logfile_header_slice[44..48].try_into().unwrap()),
-            events_lost: u32::from_le_bytes(logfile_header_slice[48..52].try_into().unwrap()),
-            cpu_speed_mhz: u32::from_le_bytes(logfile_header_slice[52..56].try_into().unwrap()),
-
-            logger_name_ptr,
-            log_file_name_ptr,
-
-            time_zone: TimeZoneInformation::try_from(&logfile_header_slice[time_zone_offset..time_zone_offset+172]).unwrap(),
-            // 4 bytes of padding
-            boot_time: i64::from_le_bytes(logfile_header_slice[time_zone_offset+176..time_zone_offset+184].try_into().unwrap()),
-            perf_freq: i64::from_le_bytes(logfile_header_slice[time_zone_offset+184..time_zone_offset+192].try_into().unwrap()),
-            start_time: i64::from_le_bytes(logfile_header_slice[time_zone_offset+192..time_zone_offset+200].try_into().unwrap()),
-            reserved_flags: u32::from_le_bytes(logfile_header_slice[time_zone_offset+192..time_zone_offset+196].try_into().unwrap()),
-            buffers_lost: u32::from_le_bytes(logfile_header_slice[time_zone_offset+196..time_zone_offset+200].try_into().unwrap()),
-        };
-
-        // the payload contains the logger and log file names
-        let mut payload_buf = vec![0u8; payload_size];
-        reader.read_exact(payload_buf.as_mut_slice())?;
-
-        let mut payload_reader = Cursor::new(&payload_buf);
-        let logger_name = read_nul_terminated_utf16_le(&mut payload_reader)?;
-        let log_file_name = read_nul_terminated_utf16_le(&mut payload_reader)?;
-
-        return Ok(TraceEvent::System(SystemTraceEvent {
-            system_header,
-            logfile_header,
-            logger_name,
-            log_file_name,
-        }));
+            return Err(EtlError::UnknownSystemHeaderType(system_header.hook_id));
+        }
     }
 
     Err(EtlError::UnknownHeaderType(trace_header_type))

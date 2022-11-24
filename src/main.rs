@@ -2,12 +2,12 @@ mod etl;
 
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 use std::path::PathBuf;
 
 use clap::Parser;
 
-use crate::etl::{read_wmi_buffer_header, read_event};
+use crate::etl::{read_wmi_buffer, read_event};
 
 
 #[derive(Parser)]
@@ -23,9 +23,15 @@ fn main() {
         .expect("failed to open ETL file");
     let mut file_reader = BufReader::new(file);
 
-    read_wmi_buffer_header(&mut file_reader)
-        .expect("failed to read ETL header");
-    let header_event = read_event(&mut file_reader)
-        .expect("failed to read header event");
-    eprintln!("{:#?}", header_event);
+    loop {
+        let buffer = read_wmi_buffer(&mut file_reader, false)
+            .expect("failed to read WMI buffer");
+        let mut buffer_cursor = Cursor::new(&buffer.payload);
+
+        loop {
+            let event = read_event(&mut buffer_cursor)
+                .expect("failed to read event");
+            eprintln!("event: {:#?}", event);
+        }
+    }
 }
