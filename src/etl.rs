@@ -1,9 +1,10 @@
 //! Functionality for reading ETL tracing files.
 //!
-//! To read an ETL file, call the following functions in sequence:
+//! To read an ETL file:
 //!
-//! 1. [read_wmi_buffer_header]
-//! 2. [read_event] (obtaining a TRACE_LOGFILE_HEADER)
+//! 1. Repeatedly call [read_wmi_buffer] to obtain each buffer.
+//!
+//! 2. For each WMI buffer, repeatedly call [read_event] to obtain each event.
 
 
 use std::fmt;
@@ -183,6 +184,14 @@ impl TraceHeaderType {
             _ => false,
         }
     }
+
+    pub fn is_event_header(&self) -> bool {
+        match self {
+            Self::EventHeader32 => true,
+            Self::EventHeader64 => true,
+            _ => false,
+        }
+    }
 }
 
 
@@ -325,6 +334,29 @@ pub(crate) struct SystemTraceHeader {
     pub user_time: Option<u32>,
 }
 
+
+/// The event trace header. Describes basic metadata of a set of events.
+///
+/// Reconstructed from [Geoff Chappell's description of `EVENT_TRACE_HEADER`].
+/// 
+/// [Geoff Chappell's description of `EVENT_TRACE_HEADER`](https://www.geoffchappell.com/studies/windows/km/ntoskrnl/api/etw/tracelog/event_trace_header.htm)
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct EventTraceHeader {
+    pub size: u16,
+    pub header_type: TraceHeaderType,
+    pub marker_flags: u8,
+    pub class_type: u8,
+    pub class_level: u8,
+    pub class_version: u16,
+    pub thread_id: u32,
+    pub process_id: u32,
+    pub time_stamp: i64,
+    pub guid: WindowsGuid,
+    pub kernel_time: u32,
+    pub user_time: u32,
+}
+
+
 /// The trace logfile header. Describes more detailed metadata of the whole trace.
 ///
 /// Reconstructed from [Geoff Chappell's description of `TRACE_LOGFILE_HEADER`].
@@ -387,7 +419,7 @@ pub(crate) struct Unknown50Event {
 pub(crate) enum TraceEvent {
     TraceLogfileHeader(TraceLogfileHeaderEvent),
     Unknown50(Unknown50Event),
-    Padding(usize),
+    EventTrace(EventTraceHeader, Vec<u8>),
 }
 
 
@@ -431,13 +463,14 @@ pub(crate) fn read_wmi_buffer<R: BufRead>(mut etl_reader: R, store_padding: bool
         buffer_type: u16::from_le_bytes(header_buf[54..56].try_into().unwrap()),
         union_of_pretty_much_everything: header_buf[56..72].try_into().unwrap(),
     };
-    let offset_usize: usize = header.offset.try_into().unwrap();
+    let offset_usize = usize::try_from(header.offset).unwrap();
+    let payload_size = offset_usize - header_buf.len();
 
-    let mut payload = vec![0u8; offset_usize];
+    let mut payload = vec![0u8; payload_size];
     etl_reader.read_exact(&mut payload)?;
 
     let buffer_size: usize = header.buffer_size.try_into().unwrap();
-    let padding_size = buffer_size - (header_buf.len() + offset_usize);
+    let padding_size = buffer_size - offset_usize;
     let mut padding_vec = vec![0u8; padding_size];
     etl_reader.read_exact(&mut padding_vec)?;
 
@@ -568,6 +601,32 @@ pub(crate) fn read_event<R: BufRead>(mut buffer_reader: R) -> Result<TraceEvent,
         } else {
             return Err(EtlError::UnknownSystemHeaderType(system_header.hook_id));
         }
+    } else if trace_header_type.is_event_header() {
+        let mut more_header_bytes = [0u8; 44];
+        buffer_reader.read_exact(&mut more_header_bytes)?;
+
+        let size = u16::from_le_bytes(header_bytes[0..2].try_into().unwrap());
+        let payload_size = usize::from(size) - (header_bytes.len() + more_header_bytes.len());
+
+        let event_header = EventTraceHeader {
+            size,
+            header_type: header_bytes[2].into(),
+            marker_flags: header_bytes[3],
+            class_type: more_header_bytes[0],
+            class_level: more_header_bytes[1],
+            class_version: u16::from_le_bytes(more_header_bytes[2..4].try_into().unwrap()),
+            thread_id: u32::from_le_bytes(more_header_bytes[4..8].try_into().unwrap()),
+            process_id: u32::from_le_bytes(more_header_bytes[8..12].try_into().unwrap()),
+            time_stamp: i64::from_le_bytes(more_header_bytes[12..20].try_into().unwrap()),
+            guid: WindowsGuid::try_from(&more_header_bytes[20..36]).unwrap(),
+            kernel_time: u32::from_le_bytes(more_header_bytes[36..40].try_into().unwrap()),
+            user_time: u32::from_le_bytes(more_header_bytes[40..44].try_into().unwrap()),
+        };
+
+        let mut payload = vec![0u8; payload_size];
+        buffer_reader.read_exact(&mut payload)?;
+
+        return Ok(TraceEvent::EventTrace(event_header, payload));
     }
 
     Err(EtlError::UnknownHeaderType(trace_header_type))
