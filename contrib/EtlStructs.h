@@ -138,3 +138,19 @@ public struct TraceLogfileHeader {
     uint32_t reserved_flags;
     uint32_t buffers_lost;
 };
+
+public struct EventTraceHeader
+{
+    uint16_t size;
+    uint8_t header_type;
+    uint8_t marker_flags;
+    uint8_t class_type;
+    uint8_t class_level;
+    uint16_t class_version;
+    uint32_t thread_id;
+    uint32_t process_id;
+    int64_t time_stamp;
+    WindowsGuid guid;
+    uint32_t kernel_time;
+    uint32_t user_time;
+};
