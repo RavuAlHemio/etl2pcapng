@@ -85,6 +85,14 @@ pub(crate) enum PossiblePadding {
     Stored(Vec<u8>),
     DroppedSize(usize),
 }
+impl PossiblePadding {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Stored(padding) => padding.len(),
+            Self::DroppedSize(size) => *size,
+        }
+    }
+}
 impl Default for PossiblePadding {
     fn default() -> Self { Self::Stored(Vec::with_capacity(0)) }
 }
@@ -192,6 +200,14 @@ impl TraceHeaderType {
             _ => false,
         }
     }
+
+    pub fn is_event_trace_header(&self) -> bool {
+        match self {
+            Self::Full32 => true,
+            Self::Full64 => true,
+            _ => false,
+        }
+    }
 }
 
 
@@ -234,6 +250,14 @@ impl TryFrom<&[u8]> for WindowsGuid {
         })
     }
 }
+
+/// The zero GUID, {00000000-0000-0000-0000-000000000000}.
+pub(crate) const ZERO_GUID: WindowsGuid = WindowsGuid {
+    data1: 0,
+    data2: 0,
+    data3: 0,
+    data4: [0u8; 8],
+};
 
 
 /// Windows date and time information structure.
@@ -335,6 +359,46 @@ pub(crate) struct SystemTraceHeader {
 }
 
 
+/// A descriptor describing an event.
+///
+/// Reconstructed from [Microsoft's `EVENT_DESCRIPTOR` documentation].
+///
+/// [Microsoft's `EVENT_DESCRIPTOR` documentation](https://learn.microsoft.com/en-us/windows/win32/api/evntprov/ns-evntprov-event_descriptor)
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct EventDescriptor {
+    pub id: u16,
+    pub version: u8,
+    pub channel: u8,
+    pub level: u8,
+    pub opcode: u8,
+    pub task: u16,
+    pub keyword: u64,
+}
+
+
+/// The event header. Describes basic metadata of a set of events.
+///
+/// Reconstructed from [Geoff Chappell's description of `EVENT_HEADER`].
+/// 
+/// [Geoff Chappell's description of `EVENT_HEADER`](https://www.geoffchappell.com/studies/windows/km/ntoskrnl/api/etw/tracelog/event_header.htm)
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct EventHeader {
+    pub size: u16,
+    pub header_type: TraceHeaderType,
+    pub marker_flags: u8, // not part of the official definition, but used as such
+    pub flags: u16,
+    pub event_property: u16,
+    pub thread_id: u32,
+    pub process_id: u32,
+    pub time_stamp: i64,
+    pub provider_id: WindowsGuid,
+    pub event_descriptor: EventDescriptor,
+    pub kernel_time: u32,
+    pub user_time: u32,
+    pub activity_id: WindowsGuid,
+}
+
+
 /// The event trace header. Describes basic metadata of a set of events.
 ///
 /// Reconstructed from [Geoff Chappell's description of `EVENT_TRACE_HEADER`].
@@ -419,7 +483,18 @@ pub(crate) struct Unknown50Event {
 pub(crate) enum TraceEvent {
     TraceLogfileHeader(TraceLogfileHeaderEvent),
     Unknown50(Unknown50Event),
+    Event(EventHeader, Vec<u8>),
     EventTrace(EventTraceHeader, Vec<u8>),
+}
+impl TraceEvent {
+    pub fn guid(&self) -> Option<&WindowsGuid> {
+        match self {
+            Self::TraceLogfileHeader(lh) => Some(&lh.logfile_header.log_instance_guid),
+            Self::Unknown50(_evt) => None,
+            Self::Event(hdr, _payload) => Some(&hdr.activity_id),
+            Self::EventTrace(hdr, _payload) => Some(&hdr.guid),
+        }
+    }
 }
 
 
@@ -489,9 +564,27 @@ pub(crate) fn read_wmi_buffer<R: BufRead>(mut etl_reader: R, store_padding: bool
 
 
 pub(crate) fn read_event<R: BufRead>(mut buffer_reader: R) -> Result<TraceEvent, EtlError> {
+    let mut buffer_bytes_read = 0;
+
+    let event = internal_read_event(&mut buffer_reader, &mut buffer_bytes_read)?;
+
+    // skip padding
+    let padding = 8 - buffer_bytes_read % 8;
+    // if padding == 8, we're already on an 8-byte boundary
+    if padding < 8 {
+        let mut nevermind = vec![0u8; padding];
+        buffer_reader.read_exact(&mut nevermind)?;
+    }
+
+    Ok(event)
+}
+
+
+fn internal_read_event<R: BufRead>(mut buffer_reader: R, buffer_bytes_read: &mut usize) -> Result<TraceEvent, EtlError> {
     // read 4 header bytes
     let mut header_bytes = [0u8; 4];
     buffer_reader.read_exact(&mut header_bytes)?;
+    *buffer_bytes_read += header_bytes.len();
 
     let trace_header_type: TraceHeaderType = header_bytes[2].into();
     if trace_header_type.is_system() {
@@ -503,6 +596,7 @@ pub(crate) fn read_event<R: BufRead>(mut buffer_reader: R) -> Result<TraceEvent,
             buffer_reader.read_exact(&mut more_header_bytes)?;
             &more_header_bytes
         };
+        *buffer_bytes_read += more_header_slice.len();
 
         let size = u16::from_le_bytes(more_header_slice[0..2].try_into().unwrap());
         let logfile_header_and_payload_size = usize::from(size) - (header_bytes.len() + more_header_slice.len());
@@ -536,6 +630,7 @@ pub(crate) fn read_event<R: BufRead>(mut buffer_reader: R) -> Result<TraceEvent,
                 let log_file_name_ptr = u32::from_le_bytes(logfile_header_bytes[60..64].try_into().unwrap()).into();
                 (&logfile_header_bytes[..272], logger_name_ptr, log_file_name_ptr, 64)
             };
+            *buffer_bytes_read += logfile_header_slice.len();
             let payload_size = logfile_header_and_payload_size - logfile_header_slice.len();
 
             // deconstruct the logfile header
@@ -574,15 +669,11 @@ pub(crate) fn read_event<R: BufRead>(mut buffer_reader: R) -> Result<TraceEvent,
             // the payload contains the logger and log file names
             let mut payload_buf = vec![0u8; payload_size];
             buffer_reader.read_exact(payload_buf.as_mut_slice())?;
+            *buffer_bytes_read += payload_buf.len();
 
             let mut payload_reader = Cursor::new(&payload_buf);
             let logger_name = read_nul_terminated_utf16_le(&mut payload_reader)?;
             let log_file_name = read_nul_terminated_utf16_le(&mut payload_reader)?;
-
-            // skip padding
-            let padding = 0x10 - (header_bytes.len() + more_header_slice.len() + logfile_header_slice.len() + payload_size) % 0x10;
-            let mut nevermind = vec![0u8; padding];
-            buffer_reader.read_exact(&mut nevermind)?;
 
             return Ok(TraceEvent::TraceLogfileHeader(TraceLogfileHeaderEvent {
                 system_header,
@@ -594,6 +685,8 @@ pub(crate) fn read_event<R: BufRead>(mut buffer_reader: R) -> Result<TraceEvent,
             // no idea what happens here
             let mut full_payload = vec![0u8; logfile_header_and_payload_size.try_into().unwrap()];
             buffer_reader.read_exact(&mut full_payload)?;
+            *buffer_bytes_read += full_payload.len();
+
             return Ok(TraceEvent::Unknown50(Unknown50Event {
                 system_header,
                 full_payload,
@@ -601,14 +694,15 @@ pub(crate) fn read_event<R: BufRead>(mut buffer_reader: R) -> Result<TraceEvent,
         } else {
             return Err(EtlError::UnknownSystemHeaderType(system_header.hook_id));
         }
-    } else if trace_header_type.is_event_header() {
+    } else if trace_header_type.is_event_trace_header() {
         let mut more_header_bytes = [0u8; 44];
         buffer_reader.read_exact(&mut more_header_bytes)?;
+        *buffer_bytes_read += more_header_bytes.len();
 
         let size = u16::from_le_bytes(header_bytes[0..2].try_into().unwrap());
         let payload_size = usize::from(size) - (header_bytes.len() + more_header_bytes.len());
 
-        let event_header = EventTraceHeader {
+        let event_trace_header = EventTraceHeader {
             size,
             header_type: header_bytes[2].into(),
             marker_flags: header_bytes[3],
@@ -625,8 +719,46 @@ pub(crate) fn read_event<R: BufRead>(mut buffer_reader: R) -> Result<TraceEvent,
 
         let mut payload = vec![0u8; payload_size];
         buffer_reader.read_exact(&mut payload)?;
+        *buffer_bytes_read += payload.len();
 
-        return Ok(TraceEvent::EventTrace(event_header, payload));
+        return Ok(TraceEvent::EventTrace(event_trace_header, payload));
+    } else if trace_header_type.is_event_header() {
+        let mut more_header_bytes = [0u8; 76];
+        buffer_reader.read_exact(&mut more_header_bytes)?;
+        *buffer_bytes_read += more_header_bytes.len();
+
+        let size = u16::from_le_bytes(header_bytes[0..2].try_into().unwrap());
+        let payload_size = usize::from(size) - (header_bytes.len() + more_header_bytes.len());
+
+        let event_header = EventHeader {
+            size,
+            header_type: header_bytes[2].into(),
+            marker_flags: header_bytes[3],
+            flags: u16::from_le_bytes(more_header_bytes[0..2].try_into().unwrap()),
+            event_property: u16::from_le_bytes(more_header_bytes[2..4].try_into().unwrap()),
+            thread_id: u32::from_le_bytes(more_header_bytes[4..8].try_into().unwrap()),
+            process_id: u32::from_le_bytes(more_header_bytes[8..12].try_into().unwrap()),
+            time_stamp: i64::from_le_bytes(more_header_bytes[12..20].try_into().unwrap()),
+            provider_id: WindowsGuid::try_from(&more_header_bytes[20..36]).unwrap(),
+            event_descriptor: EventDescriptor {
+                id: u16::from_le_bytes(more_header_bytes[36..38].try_into().unwrap()),
+                version: more_header_bytes[38],
+                channel: more_header_bytes[39],
+                level: more_header_bytes[40],
+                opcode: more_header_bytes[41],
+                task: u16::from_le_bytes(more_header_bytes[42..44].try_into().unwrap()),
+                keyword: u64::from_le_bytes(more_header_bytes[44..52].try_into().unwrap()),
+            },
+            kernel_time: u32::from_le_bytes(more_header_bytes[52..56].try_into().unwrap()),
+            user_time: u32::from_le_bytes(more_header_bytes[56..60].try_into().unwrap()),
+            activity_id: WindowsGuid::try_from(&more_header_bytes[60..76]).unwrap(),
+        };
+
+        let mut payload = vec![0u8; payload_size];
+        buffer_reader.read_exact(&mut payload)?;
+        *buffer_bytes_read += payload.len();
+
+        return Ok(TraceEvent::Event(event_header, payload));
     }
 
     Err(EtlError::UnknownHeaderType(trace_header_type))
