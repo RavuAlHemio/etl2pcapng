@@ -1,4 +1,5 @@
 mod etl;
+mod ndiscap;
 
 
 use std::fs::File;
@@ -7,7 +8,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use crate::etl::{read_wmi_buffer, read_event, TraceEvent};
+use crate::etl::{decode_timestamp, read_wmi_buffer, read_event, TraceEvent};
+use crate::ndiscap::decode_event;
 
 
 #[derive(Parser)]
@@ -23,6 +25,7 @@ fn main() {
         .expect("failed to open ETL file");
     let mut file_reader = BufReader::new(file);
 
+    let mut start_time = decode_timestamp(0);
     loop {
         let inner_buf = file_reader.fill_buf()
             .expect("failed to obtain contents of inner buffer");
@@ -39,8 +42,12 @@ fn main() {
             let event = read_event(&mut buffer_cursor)
                 .expect("failed to read event");
             match &event {
-                TraceEvent::Event(hdr, _payload) => {
-                    eprintln!("event with header: {:#?}", hdr);
+                TraceEvent::TraceLogfileHeader(tlh) => {
+                    start_time = decode_timestamp(tlh.logfile_header.start_time);
+                },
+                TraceEvent::Event(evt) => {
+                    let decoded_res = decode_event(evt, start_time);
+                    eprintln!("decoded event: {:#?}", decoded_res);
                 },
                 _ => {},
             }

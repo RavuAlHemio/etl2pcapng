@@ -11,6 +11,7 @@ use std::fmt;
 use std::io::{self, BufRead, Cursor, Read};
 use std::string::FromUtf16Error;
 
+use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use from_to_repr::from_to_other;
 
 
@@ -226,6 +227,25 @@ pub(crate) struct WindowsGuid {
     pub data3: u16,
     pub data4: [u8; 8],
 }
+impl WindowsGuid {
+    pub const fn from_u128(value: u128) -> Self {
+        Self {
+            data1: ((value >> 96) & 0xFFFFFFFF) as u32,
+            data2: ((value >> 80) & 0xFFFF) as u16,
+            data3: ((value >> 64) & 0xFFFF) as u16,
+            data4: [
+                ((value >> 56) & 0xFF) as u8,
+                ((value >> 48) & 0xFF) as u8,
+                ((value >> 40) & 0xFF) as u8,
+                ((value >> 32) & 0xFF) as u8,
+                ((value >> 24) & 0xFF) as u8,
+                ((value >> 16) & 0xFF) as u8,
+                ((value >>  8) & 0xFF) as u8,
+                ((value >>  0) & 0xFF) as u8,
+            ],
+        }
+    }
+}
 impl fmt::Display for WindowsGuid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -233,6 +253,9 @@ impl fmt::Display for WindowsGuid {
             self.data1, self.data2, self.data3, self.data4[0], self.data4[1], self.data4[2], self.data4[3], self.data4[4], self.data4[5], self.data4[6], self.data4[7],
         )
     }
+}
+impl From<u128> for WindowsGuid {
+    fn from(value: u128) -> Self { Self::from_u128(value) }
 }
 impl TryFrom<&[u8]> for WindowsGuid {
     type Error = ();
@@ -477,22 +500,36 @@ pub(crate) struct Unknown50Event {
     pub full_payload: Vec<u8>,
 }
 
+/// An event from the event log.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct Event {
+    pub header: EventHeader,
+    pub payload: Vec<u8>,
+}
+
+/// An entry describing an event trace.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct EventTrace {
+    pub header: EventTraceHeader,
+    pub payload: Vec<u8>,
+}
+
 
 /// Any kind of trace event.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum TraceEvent {
     TraceLogfileHeader(TraceLogfileHeaderEvent),
     Unknown50(Unknown50Event),
-    Event(EventHeader, Vec<u8>),
-    EventTrace(EventTraceHeader, Vec<u8>),
+    Event(Event),
+    EventTrace(EventTrace),
 }
 impl TraceEvent {
     pub fn guid(&self) -> Option<&WindowsGuid> {
         match self {
             Self::TraceLogfileHeader(lh) => Some(&lh.logfile_header.log_instance_guid),
             Self::Unknown50(_evt) => None,
-            Self::Event(hdr, _payload) => Some(&hdr.activity_id),
-            Self::EventTrace(hdr, _payload) => Some(&hdr.guid),
+            Self::Event(evt) => Some(&evt.header.activity_id),
+            Self::EventTrace(trc) => Some(&trc.header.guid),
         }
     }
 }
@@ -721,7 +758,10 @@ fn internal_read_event<R: BufRead>(mut buffer_reader: R, buffer_bytes_read: &mut
         buffer_reader.read_exact(&mut payload)?;
         *buffer_bytes_read += payload.len();
 
-        return Ok(TraceEvent::EventTrace(event_trace_header, payload));
+        return Ok(TraceEvent::EventTrace(EventTrace {
+            header: event_trace_header,
+            payload,
+        }));
     } else if trace_header_type.is_event_header() {
         let mut more_header_bytes = [0u8; 76];
         buffer_reader.read_exact(&mut more_header_bytes)?;
@@ -758,8 +798,55 @@ fn internal_read_event<R: BufRead>(mut buffer_reader: R, buffer_bytes_read: &mut
         buffer_reader.read_exact(&mut payload)?;
         *buffer_bytes_read += payload.len();
 
-        return Ok(TraceEvent::Event(event_header, payload));
+        return Ok(TraceEvent::Event(Event {
+            header: event_header,
+            payload,
+        }));
     }
 
     Err(EtlError::UnknownHeaderType(trace_header_type))
+}
+
+
+/// Decodes an ETW timestamp as a duration.
+pub(crate) fn decode_timestamp_duration(etw_timestamp: i64) -> Duration {
+    // 1 unit is 100ns
+    // obtain the absolute value to escape any stupid behavior regarding % with negative numbers
+    let (abs_timestamp, negate) = if etw_timestamp < 0 {
+        (-etw_timestamp, true)
+    } else {
+        (etw_timestamp, false)
+    };
+    let abs_duration_since_epoch =
+        Duration::microseconds(abs_timestamp / 10)
+        + Duration::nanoseconds((abs_timestamp % 10) * 100)
+    ;
+    if negate {
+        -abs_duration_since_epoch
+    } else {
+        abs_duration_since_epoch
+    }
+}
+
+
+/// Decodes an ETW timestamp.
+pub(crate) fn decode_timestamp(etw_timestamp: i64) -> DateTime<Utc> {
+    // timestamp: 100ns units since 1601-01-01 00:00:00 UTC
+    let base_date_time_naive = NaiveDate::from_ymd_opt(1601, 1, 1).unwrap()
+        .and_hms_opt(0, 0, 0).unwrap();
+    let base_date_time = Utc.from_utc_datetime(&base_date_time_naive);
+
+    let duration = decode_timestamp_duration(etw_timestamp);
+    base_date_time + duration
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::WindowsGuid;
+
+    #[test]
+    fn test_guid_from_u128() {
+        assert_eq!(WindowsGuid::from(0x01234567_89AB_CDEF_0123_456789ABCDEFu128).to_string(), "01234567-89AB-CDEF-0123-456789ABCDEF");
+    }
 }
