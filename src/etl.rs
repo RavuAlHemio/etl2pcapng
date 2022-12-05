@@ -479,6 +479,31 @@ pub(crate) struct TraceLogfileHeader {
     pub reserved_flags: u32,
     pub buffers_lost: u32,
 }
+impl TraceLogfileHeader {
+    /// Obtains the scaling factor for the relative timestamps contained in each event's header.
+    ///
+    /// Reconstructed from [Microsoft's `WNODE_HEADER` documentation], specifically the Remarks
+    /// section.
+    ///
+    /// [Microsoft's `WNODE_HEADER` documentation](https://learn.microsoft.com/en-us/windows/win32/etw/wnode-header)
+    pub fn time_stamp_scale(&self) -> f64 {
+        match self.reserved_flags {
+            1 => {
+                // QueryPerformanceCounter
+                10_000_000.0 / (self.perf_freq as f64)
+            },
+            2 => {
+                // system time
+                1.0
+            },
+            3 => {
+                // CPU cycle counter
+                10.0 / f64::from(self.cpu_speed_mhz)
+            },
+            _ => 0.0,
+        }
+    }
+}
 
 /// A trace logfile header event.
 ///
