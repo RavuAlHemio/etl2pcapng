@@ -42,7 +42,6 @@ fn main() {
 
         let buffer = read_wmi_buffer(&mut file_reader, false)
             .expect("failed to read WMI buffer");
-        eprintln!("new buffer with {} bytes of payload and {} bytes of padding", buffer.payload.len(), buffer.padding.len());
         let mut buffer_cursor = Cursor::new(&buffer.payload);
 
         loop {
