@@ -16,6 +16,24 @@ use crate::etl::{decode_timestamp_duration, Event, WindowsGuid};
 const NDIS_CAPTURE_GUID: WindowsGuid = WindowsGuid::from_u128(0x2ED6006E_4729_4609_B423_3EE7BCD678EF);
 
 
+/// Event keyword (bitflag) identifying a Wireless WAN packet, which has a raw IP header.
+///
+/// The keyword is known as `WirelessWAN` and can be found in the NDIS capture manifest.
+const KEYWORD_WIRELESS_WAN: u64 = 0x0200;
+
+
+/// Event keyword (bitflag) identifying a native 802.11 packet.
+///
+/// The keyword is known as `Native802.11` and can be found in the NDIS capture manifest.
+const KEYWORD_NATIVE_802_11: u64 = 0x0001_0000;
+
+
+/// Event keyword (bitflag) identifying an outbound packet.
+///
+/// The keyword is known as `ut:SendPath` and can be found in the NDIS capture manifest.
+const KEYWORD_UT_SEND_PATH: u64 = 0x0001_0000_0000;
+
+
 /// An NDIS event that represents a captured packet.
 #[derive(Clone, Debug, Hash, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum NdisCaptureEvent {
@@ -33,8 +51,10 @@ pub(crate) enum NdisCaptureEvent {
 #[derive(Clone, Debug, Hash, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PacketDataEvent {
     pub event_metadata: NdisEventMetadata,
+    pub encapsulation: Encapsulation,
     pub miniport_if_index: u32,
     pub lower_if_index: u32,
+    pub outbound: bool,
     pub fragment: Vec<u8>,
 }
 
@@ -57,6 +77,26 @@ pub struct NdisEventMetadata {
     pub process_id: u32,
     pub timestamp: DateTime<Utc>,
 }
+
+/// The type of encapsulation of the packet fragment.
+///
+/// Flags that can be used to detect the encapsulation of a packet are stored in the keywords of the
+/// event.
+#[derive(Clone, Copy, Debug, Hash, Eq, Ord, PartialEq, PartialOrd)]
+pub enum Encapsulation {
+    /// Ethernet (IEEE 802.3) encapsulation.
+    Ethernet,
+
+    /// IEEE 802.11 (WiFi) encapsulation.
+    Ieee80211,
+
+    /// Raw IP (no layer 1/2) encapsulation.
+    RawIp,
+}
+impl Default for Encapsulation {
+    fn default() -> Self { Self::Ethernet }
+}
+
 
 /// An error that can occur when trying to decode an event.
 #[derive(Debug)]
@@ -109,7 +149,14 @@ pub(crate) fn decode_event(event: &Event, start_time: DateTime<Utc>) -> Result<N
             let mut fragment = vec![0u8; fragment_size_usize];
             payload_cursor.read_exact(&mut fragment)?;
 
-            // TODO: identify and pass on fragment type from event headers: Ethernet vs. 802.11 vs. raw (naked IP)
+            let encapsulation = if event.header.event_descriptor.keyword & KEYWORD_NATIVE_802_11 != 0 {
+                Encapsulation::Ieee80211
+            } else if event.header.event_descriptor.keyword & KEYWORD_WIRELESS_WAN != 0 {
+                Encapsulation::RawIp
+            } else {
+                Encapsulation::Ethernet
+            };
+            let outbound = event.header.event_descriptor.keyword & KEYWORD_UT_SEND_PATH != 0;
 
             NdisCaptureEvent::PacketData(PacketDataEvent {
                 event_metadata: NdisEventMetadata {
@@ -117,8 +164,10 @@ pub(crate) fn decode_event(event: &Event, start_time: DateTime<Utc>) -> Result<N
                     process_id: event.header.process_id,
                     timestamp,
                 },
+                encapsulation,
                 miniport_if_index,
                 lower_if_index,
+                outbound,
                 fragment,
             })
         },
