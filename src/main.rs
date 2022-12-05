@@ -1,20 +1,23 @@
 mod etl;
 mod ndiscap;
+mod pcapng;
 
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Cursor};
+use std::io::{BufRead, BufReader, BufWriter, Cursor};
 use std::path::PathBuf;
 
 use clap::Parser;
 
 use crate::etl::{decode_timestamp, read_wmi_buffer, read_event, TraceEvent};
 use crate::ndiscap::{decode_event, NdisCaptureEvent};
+use crate::pcapng::{collect_interfaces, write_pcapng};
 
 
 #[derive(Parser)]
 struct Opts {
     pub etl_file: PathBuf,
+    pub pcapng_file: PathBuf,
 }
 
 
@@ -73,4 +76,22 @@ fn main() {
     }
 
     packets.sort_unstable_by_key(|p| p.event_metadata.timestamp);
+
+    // extract devices from PCAP file
+    let (interfaces, interface_mapping) = collect_interfaces(packets.iter())
+        .expect("failed to collect capture interfaces");
+
+    {
+        let pcapng_file = File::create(&opts.pcapng_file)
+            .expect("failed to open PCAPNG file");
+        let file_writer = BufWriter::new(pcapng_file);
+
+        write_pcapng(
+            packets.iter(),
+            file_writer,
+            &interfaces,
+            &interface_mapping,
+        )
+            .expect("failed to write PCAPNG file")
+    }
 }
