@@ -699,8 +699,8 @@ fn internal_read_event<R: BufRead>(mut buffer_reader: R, buffer_bytes_read: &mut
                 boot_time: i64::from_le_bytes(logfile_header_slice[time_zone_offset+176..time_zone_offset+184].try_into().unwrap()),
                 perf_freq: i64::from_le_bytes(logfile_header_slice[time_zone_offset+184..time_zone_offset+192].try_into().unwrap()),
                 start_time: i64::from_le_bytes(logfile_header_slice[time_zone_offset+192..time_zone_offset+200].try_into().unwrap()),
-                reserved_flags: u32::from_le_bytes(logfile_header_slice[time_zone_offset+192..time_zone_offset+196].try_into().unwrap()),
-                buffers_lost: u32::from_le_bytes(logfile_header_slice[time_zone_offset+196..time_zone_offset+200].try_into().unwrap()),
+                reserved_flags: u32::from_le_bytes(logfile_header_slice[time_zone_offset+200..time_zone_offset+204].try_into().unwrap()),
+                buffers_lost: u32::from_le_bytes(logfile_header_slice[time_zone_offset+204..time_zone_offset+208].try_into().unwrap()),
             };
 
             // the payload contains the logger and log file names
