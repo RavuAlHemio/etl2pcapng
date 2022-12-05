@@ -42,6 +42,12 @@ pub(crate) enum NdisCaptureEvent {
 
     /// Packet metadata event in an NDIS capture.
     PacketMetadata(PacketMetadataEvent),
+
+    /// Rundown information in an NDIS capture.
+    SourceInfo(SourceInfoEvent),
+
+    /// Source information in an NDIS capture.
+    RundownInfo(RundownInfoEvent),
 }
 
 /// A packet data event in an NDIS capture.
@@ -68,6 +74,34 @@ pub struct PacketMetadataEvent {
     pub miniport_if_index: u32,
     pub lower_if_index: u32,
     pub metadata: Vec<u8>,
+}
+
+/// A rundown information event in an NDIS capture.
+///
+/// The event is provided by the NDIS capture event provider (see [`NDIS_CAPTURE_GUID`]); the event
+/// ID is 5100.
+#[derive(Clone, Debug, Hash, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RundownInfoEvent {
+    pub event_metadata: NdisEventMetadata,
+    pub source_id: u8,
+    pub rundown_id: u32,
+    pub param1: u64,
+    pub param2: u64,
+    pub param_string: String,
+    pub description: String,
+}
+
+/// A source information event in an NDIS capture.
+///
+/// The event is provided by the NDIS capture event provider (see [`NDIS_CAPTURE_GUID`]); the event
+/// ID is 5101.
+#[derive(Clone, Debug, Hash, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SourceInfoEvent {
+    pub event_metadata: NdisEventMetadata,
+    pub source_id: u8,
+    pub source_name: String,
+    pub interface_index: u32,
+    pub layer_info: Vec<i16>,
 }
 
 /// Metadata of an NDIS capture event, common to all Windows events.
@@ -107,6 +141,9 @@ pub(crate) enum NdisEventError {
     /// The event ID is not supported.
     UnsupportedEventId(u16),
 
+    /// The source name could not be decoded.
+    SourceNameDecodingError(Vec<u16>),
+
     /// An I/O error occurred.
     Io(std::io::Error),
 }
@@ -115,6 +152,7 @@ impl fmt::Display for NdisEventError {
         match self {
             Self::WrongProvider => write!(f, "wrong provider for NDIS capture events"),
             Self::UnsupportedEventId(evid) => write!(f, "unsupported event ID {}", evid),
+            Self::SourceNameDecodingError(_wchars) => write!(f, "failed to decode source name"),
             Self::Io(e) => write!(f, "I/O error: {}", e),
         }
     }
@@ -126,6 +164,23 @@ impl From<std::io::Error> for NdisEventError {
 }
 
 
+/// Reads a little-endian 16-bit-character NUL-terminated string.
+fn read_str16le<R: Read>(mut whence: R) -> Result<String, NdisEventError> {
+    let mut u16_chars: Vec<u16> = Vec::new();
+    loop {
+        let mut wchar_buf = [0u8; 2];
+        whence.read_exact(&mut wchar_buf)?;
+        let wchar = u16::from_le_bytes(wchar_buf);
+        if wchar == 0x0000 {
+            break;
+        }
+        u16_chars.push(wchar);
+    }
+    String::from_utf16(&u16_chars)
+        .map_err(|_| NdisEventError::SourceNameDecodingError(u16_chars))
+}
+
+
 /// Attempts to decode an NDIS capture event.
 pub(crate) fn decode_event(event: &Event, start_time: DateTime<Utc>) -> Result<NdisCaptureEvent, NdisEventError> {
     if event.header.provider_id != NDIS_CAPTURE_GUID {
@@ -134,6 +189,11 @@ pub(crate) fn decode_event(event: &Event, start_time: DateTime<Utc>) -> Result<N
 
     let timestamp_duration = decode_timestamp_duration(event.header.time_stamp);
     let timestamp = start_time + timestamp_duration;
+    let event_metadata = NdisEventMetadata {
+        thread_id: event.header.thread_id,
+        process_id: event.header.process_id,
+        timestamp,
+    };
 
     let mut payload_cursor = Cursor::new(&event.payload);
 
@@ -159,11 +219,7 @@ pub(crate) fn decode_event(event: &Event, start_time: DateTime<Utc>) -> Result<N
             let outbound = event.header.event_descriptor.keyword & KEYWORD_UT_SEND_PATH != 0;
 
             NdisCaptureEvent::PacketData(PacketDataEvent {
-                event_metadata: NdisEventMetadata {
-                    thread_id: event.header.thread_id,
-                    process_id: event.header.process_id,
-                    timestamp,
-                },
+                event_metadata,
                 encapsulation,
                 miniport_if_index,
                 lower_if_index,
@@ -183,14 +239,57 @@ pub(crate) fn decode_event(event: &Event, start_time: DateTime<Utc>) -> Result<N
             payload_cursor.read_exact(&mut metadata)?;
 
             NdisCaptureEvent::PacketMetadata(PacketMetadataEvent {
-                event_metadata: NdisEventMetadata {
-                    thread_id: event.header.thread_id,
-                    process_id: event.header.process_id,
-                    timestamp,
-                },
+                event_metadata,
                 miniport_if_index,
                 lower_if_index,
                 metadata,
+            })
+        },
+        5100 => {
+            let mut base_buf = [0u8; 21];
+            payload_cursor.read_exact(&mut base_buf)?;
+
+            let source_id = base_buf[0];
+            let rundown_id = u32::from_le_bytes(base_buf[1..5].try_into().unwrap());
+            let param1 = u64::from_le_bytes(base_buf[5..13].try_into().unwrap());
+            let param2 = u64::from_le_bytes(base_buf[13..21].try_into().unwrap());
+            let param_string = read_str16le(&mut payload_cursor)?;
+            let description = read_str16le(&mut payload_cursor)?;
+
+            NdisCaptureEvent::RundownInfo(RundownInfoEvent {
+                source_id,
+                event_metadata,
+                rundown_id,
+                param1,
+                param2,
+                param_string,
+                description,
+            })
+        },
+        5101 => {
+            let mut base_buf = [0u8; 2];
+            payload_cursor.read_exact(&mut base_buf[0..1])?;
+            let source_id = base_buf[0];
+            let source_name = read_str16le(&mut payload_cursor)?;
+
+            let mut rest_buf = [0u8; 6];
+            payload_cursor.read_exact(&mut rest_buf)?;
+            let interface_index = u32::from_le_bytes(rest_buf[0..4].try_into().unwrap());
+            let layer_count = u16::from_le_bytes(rest_buf[4..6].try_into().unwrap());
+
+            let mut layer_info = Vec::with_capacity(layer_count.into());
+            for _ in 0..layer_count {
+                let mut layer_info_buf = [0u8; 2];
+                payload_cursor.read_exact(&mut layer_info_buf)?;
+                layer_info.push(i16::from_le_bytes(layer_info_buf));
+            }
+
+            NdisCaptureEvent::SourceInfo(SourceInfoEvent {
+                event_metadata,
+                source_id,
+                source_name,
+                interface_index,
+                layer_info,
             })
         },
         other => return Err(NdisEventError::UnsupportedEventId(other)),
