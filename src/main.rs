@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use crate::etl::{decode_timestamp, read_wmi_buffer, read_event, TraceEvent};
-use crate::ndiscap::decode_event;
+use crate::ndiscap::{decode_event, NdisCaptureEvent};
 
 
 #[derive(Parser)]
@@ -25,7 +25,11 @@ fn main() {
         .expect("failed to open ETL file");
     let mut file_reader = BufReader::new(file);
 
-    let mut start_time = decode_timestamp(0);
+    // read ETL file
+    let mut start_time_value = 0;
+    let mut timestamp_scale = 1.0;
+    let mut base_time = None;
+    let mut packets = Vec::new();
     loop {
         let inner_buf = file_reader.fill_buf()
             .expect("failed to obtain contents of inner buffer");
@@ -43,11 +47,22 @@ fn main() {
                 .expect("failed to read event");
             match &event {
                 TraceEvent::TraceLogfileHeader(tlh) => {
-                    start_time = decode_timestamp(tlh.logfile_header.start_time);
+                    start_time_value = tlh.logfile_header.start_time;
+                    timestamp_scale = tlh.logfile_header.time_stamp_scale();
                 },
                 TraceEvent::Event(evt) => {
-                    let decoded_res = decode_event(evt, start_time);
-                    eprintln!("decoded event: {:#?}", decoded_res);
+                    // base time calculation is outlined in the "Remarks" section of Microsoft's WNODE_HEADER docs
+                    if !base_time.is_some() {
+                        base_time = Some(decode_timestamp(
+                            start_time_value - ((timestamp_scale * (evt.header.time_stamp as f64)) as i64)
+                        ));
+                    }
+
+                    let decoded = decode_event(evt, base_time.unwrap(), timestamp_scale)
+                        .expect("failed to decode event");
+                    if let NdisCaptureEvent::PacketData(data_event) = decoded {
+                        packets.push(data_event);
+                    }
                 },
                 _ => {},
             }
@@ -56,4 +71,6 @@ fn main() {
             }
         }
     }
+
+    packets.sort_unstable_by_key(|p| p.event_metadata.timestamp);
 }

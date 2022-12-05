@@ -12,7 +12,8 @@ use crate::etl::{decode_timestamp_duration, Event, WindowsGuid};
 
 /// The GUID identifying the NDIS capture event provider.
 ///
-/// The official name of the provider is `Microsoft-Windows-NDIS-PacketCapture`.
+/// The official name of the provider is `Microsoft-Windows-NDIS-PacketCapture`. The GUID can be
+/// found in its manifest, among other places.
 const NDIS_CAPTURE_GUID: WindowsGuid = WindowsGuid::from_u128(0x2ED6006E_4729_4609_B423_3EE7BCD678EF);
 
 
@@ -182,13 +183,15 @@ fn read_str16le<R: Read>(mut whence: R) -> Result<String, NdisEventError> {
 
 
 /// Attempts to decode an NDIS capture event.
-pub(crate) fn decode_event(event: &Event, start_time: DateTime<Utc>) -> Result<NdisCaptureEvent, NdisEventError> {
+pub(crate) fn decode_event(event: &Event, base_time: DateTime<Utc>, timestamp_scale: f64) -> Result<NdisCaptureEvent, NdisEventError> {
     if event.header.provider_id != NDIS_CAPTURE_GUID {
         return Err(NdisEventError::WrongProvider);
     }
 
-    let timestamp_duration = decode_timestamp_duration(event.header.time_stamp);
-    let timestamp = start_time + timestamp_duration;
+    let timestamp_duration = decode_timestamp_duration(
+        (timestamp_scale * (event.header.time_stamp as f64)) as i64
+    );
+    let timestamp = base_time + timestamp_duration;
     let event_metadata = NdisEventMetadata {
         thread_id: event.header.thread_id,
         process_id: event.header.process_id,
